@@ -1,0 +1,17 @@
+module: dsbackupmon
+runtime: python27
+api_version: 1
+threadsafe: yes
+handlers:
+- url: /admin/.*
+  script: app.application
+  login: admin
+- url: .*
+  script: app.application
+libraries:
+- name: webapp2
+  version: latest
+- name: ssl
+  version: latest
+- name: pycrypto
+  version: latest
