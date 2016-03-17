@@ -17,6 +17,8 @@ from google.appengine.api.app_identity import get_application_id
 DEBUG=True
 DURATION_METRIC="custom.cloudmonitoring.googleapis.com/mapreduce_duration"
 MR_ID_LABEL="custom.cloudmonitoring.googleapis.com/mapreduce/id"
+DS_DURATION_METRIC="custom.cloudmonitoring.googleapis.com/datastore_backup_duration"
+DS_ID_LABEL="custom.cloudmonitoring.googleapis.com/datastore/backup_id"
 
 if DEBUG:
   logger=logging.getLogger()
@@ -27,15 +29,6 @@ if DEBUG:
 def cloudmonitoring():
   credentials = GoogleCredentials.get_application_default()
   return build('cloudmonitoring', 'v2beta2', credentials=credentials)
-
-
-class State(messages.Enum):
-  UNKNOWN = 0
-  SEEN_BEFORE_KICKOFF = 1
-  KICKOFF = 2
-  PROCESSING = 3
-  FINALIZED = 4
-  SEEN_AFTER_FINALIZE = 5
 
 
 class MapReduceEvent(ndb.Model):
@@ -55,6 +48,13 @@ class CreateCustomMetrics(webapp2.RequestHandler):
             "typeDescriptor": {"metricType":"gauge","valueType":"double"},
             "labels":[
                 {"key":MR_ID_LABEL, "description":"Which MapReduce this is taking this time."}]}).execute()
+    cm.metricDescriptors().create(
+      project=get_application_id(),
+      body={"name": DS_DURATION_METRIC,
+            "project": get_application_id(),
+            "typeDescriptor": {"metricType":"gauge","valueType":"double"},
+            "labels":[
+                {"key":DS_ID_LABEL, "description":"Which backup this is taking this time."}]}).execute()
 
 
 class Blank(webapp2.RequestHandler):
@@ -95,6 +95,63 @@ class SubmitMetrics(webapp2.RequestHandler):
         body={"timeseries":timeseries}).execute()
 
 
+class DatastoreAdminOperation(ndb.Model):
+  description = ndb.TextProperty()
+  status = ndb.StringProperty()
+  active_jobs = ndb.IntegerProperty()
+  active_job_ids = ndb.StringProperty(repeated=True)
+  completed_jobs = ndb.IntegerProperty()
+  last_updated = ndb.DateTimeProperty()
+  status_info = ndb.StringProperty(indexed=False)
+  service_job_id = ndb.StringProperty()
+  @classmethod
+  def _get_kind(cls):
+    return '_AE_DatastoreAdmin_Operation'
+
+
+class BackupInformation(ndb.Model):
+  name = ndb.StringProperty()
+  kinds = ndb.StringProperty(repeated=True)
+  namespaces = ndb.StringProperty(repeated=True)
+  filesystem = ndb.StringProperty()
+  destination = ndb.StringProperty()
+  start_time = ndb.DateTimeProperty(auto_now_add=True)
+  complete_time = ndb.DateTimeProperty()
+  original_app = ndb.StringProperty()
+  gs_handle = ndb.TextProperty()
+  @classmethod
+  def _get_kind(cls):
+    return '_AE_Backup_Information'
+
+
+class SubmitDsMetrics(webapp2.RequestHandler):
+  def get(self):
+    now=datetime.datetime.now()
+    timeseries=[]
+
+    for dsbackupop in DatastoreAdminOperation.query(DatastoreAdminOperation.status.IN(("Active","Created"))):
+      oldest=BackupInformation(start_time=now)
+      for info in BackupInformation.query(ancestor=dsbackupop.key):
+        if info.start_time < oldest.start_time:
+          oldest = info
+      timeseries.append({
+          "timeseriesDesc": {"project":get_application_id(),
+                             "metric":DS_DURATION_METRIC,
+                             "labels":{DS_ID_LABEL:str(dsbackupop.key.id())}},
+          "point": {
+            "start": now.replace(microsecond=0).isoformat()+"Z",
+            "end": now.replace(microsecond=0).isoformat()+"Z",
+            "doubleValue": (now-oldest.start_time).total_seconds()}})
+
+    logging.info("logging events %s" % timeseries)
+
+    if len(timeseries) > 0:
+      cm = cloudmonitoring()
+      cm.timeseries().write(
+        project=get_application_id(),
+        body={"timeseries":timeseries}).execute()
+
+
 class InsertPage(webapp2.RequestHandler):
   def post(self):
     message = json.loads(urllib.unquote(self.request.body).rstrip('='))
@@ -123,5 +180,6 @@ application = webapp2.WSGIApplication([
     webapp2.Route(r'/', Blank),
     webapp2.Route(r'/insert', InsertPage),
     webapp2.Route(r'/cloudmetrics', SubmitMetrics),
+    webapp2.Route(r'/cloudmetrics_ds', SubmitDsMetrics),
     webapp2.Route(r'/admin/create_custom_metrics', CreateCustomMetrics),
 ], debug=True)
